@@ -412,20 +412,20 @@ need_full_resync:
 
 /* SYNC ad PSYNC command implemenation. */
 void syncCommand(redisClient *c) {
-    /* ignore SYNC if already slave or in monitor mode */
+    /* すでにスレーブまたはモニタモードの場合には、SYNCを無視します。 */
     if (c->flags & REDIS_SLAVE) return;
 
-    /* Refuse SYNC requests if we are a slave but the link with our master
-     * is not ok... */
+    /* このサーバがスレーブで、マスターとのリンクが出来ない場合は、
+     * SYNCの要求を拒否します。*/
     if (server.masterhost && server.repl_state != REDIS_REPL_CONNECTED) {
         addReplyError(c,"Can't SYNC while not connected with my master");
         return;
     }
 
-    /* SYNC can't be issued when the server has pending data to send to
-     * the client about already issued commands. We need a fresh reply
-     * buffer registering the differences between the BGSAVE and the current
-     * dataset, so that we can copy to other slaves if needed. */
+    /* サーバが既に発行したコマンド内に、送信が保留されたデータがある場合は
+     * SYNCができません。必要に応じて、他のスレーブにコピーすることができる
+     * ように、BGSAVEと現在のデータセットの違いを、新しいリプライバッファに
+     * 登録する必要があります。*/
     if (listLength(c->reply) != 0 || c->bufpos != 0) {
         addReplyError(c,"SYNC and PSYNC are invalid with pending output");
         return;
@@ -433,44 +433,40 @@ void syncCommand(redisClient *c) {
 
     redisLog(REDIS_NOTICE,"Slave asks for synchronization");
 
-    /* Try a partial resynchronization if this is a PSYNC command.
-     * If it fails, we continue with usual full resynchronization, however
-     * when this happens masterTryPartialResynchronization() already
-     * replied with:
-     *
-     * +FULLRESYNC <runid> <offset>
-     *
-     * So the slave knows the new runid and offset to try a PSYNC later
-     * if the connection with the master is lost. */
+    /* PSYNCコマンドの場合、部分的な同期を試します。失敗した場合は、通常完全
+     * な同期を実行します。しかし、masterTryPartialResynchronization() が
+     *   FULLRESYNC <runid> <offset>``
+     * を返すため、スレーブはマスターとの接続が失われた場合でも後で新しい
+     * runidとオフセットを保持しているためPSYNCを実行することが出来ます。*/
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
         if (masterTryPartialResynchronization(c) == REDIS_OK) {
             server.stat_sync_partial_ok++;
-            return; /* No full resync needed, return. */
+            return; /* 完全同期をする必要はありません。 */
         } else {
             char *master_runid = c->argv[1]->ptr;
             
-            /* Increment stats for failed PSYNCs, but only if the
-             * runid is not "?", as this is used by slaves to force a full
-             * resync on purpose when they are not albe to partially
-             * resync. */
+            /* runid が`?`でない場合にPSYNCが失敗した回数をインクリメントします。
+             * これは、スレーブ部分的な同期を行えない場合に、強制的に完全な同期
+             * をするために使用されます。*/
             if (master_runid[0] != '?') server.stat_sync_partial_err++;
         }
     } else {
-        /* If a slave uses SYNC, we are dealing with an old implementation
-         * of the replication protocol (like redis-cli --slave). Flag the client
-         * so that we don't expect to receive REPLCONF ACK feedbacks. */
+        /* スレーブがSYNCを実行している場合、redis-cli --salve の様なレガシーな
+         * 同期処理実装を利用します。REDIS_PRE_PSYNCフラグがあるクライアントは
+         * REPLCONF ACKが返らない場合があります。*/
         c->flags |= REDIS_PRE_PSYNC;
     }
 
-    /* Full resynchronization. */
+    /* 完全同期を実行。 */
     server.stat_sync_full++;
 
-    /* Here we need to check if there is a background saving operation
-     * in progress, or if it is required to start one */
+    /* ここでは、実行中に非同期保存処理が行えるか、また非同期保存処理を開始する
+     * 必要があるかを判定しなければなりません。*/
     if (server.rdb_child_pid != -1) {
-        /* Ok a background save is in progress. Let's check if it is a good
-         * one for replication, i.e. if there is another slave that is
-         * registering differences since the server forked to save */
+        /* 実行中に非同期保存が行える場合、レプリケーションを行うための条件を満
+         * たしているかチェックします。
+         * 例）他のスレーブが、保存のためにフォークされてからの差分を登録してい
+         *     るか。 */
         redisClient *slave;
         listNode *ln;
         listIter li;
@@ -481,19 +477,20 @@ void syncCommand(redisClient *c) {
             if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END) break;
         }
         if (ln) {
-            /* Perfect, the server is already registering differences for
-             * another slave. Set the right state, and copy the buffer. */
+            /* 完璧！ サーバは既に他のスレーブとの差分を登録している。
+             * バッファをコピーして、ステータスにREDIS_REPL_WAIT_BGSAVE_ENDを
+             * セットしましょう。*/
             copyClientOutputBuffer(c,slave);
             c->replstate = REDIS_REPL_WAIT_BGSAVE_END;
             redisLog(REDIS_NOTICE,"Waiting for end of BGSAVE for SYNC");
         } else {
-            /* No way, we need to wait for the next BGSAVE in order to
-             * register differences */
+            /* そんなバカな！ サーバは差分を登録するために、次のBGSAVEを待つ
+             * 必要があります。 */
             c->replstate = REDIS_REPL_WAIT_BGSAVE_START;
             redisLog(REDIS_NOTICE,"Waiting for next BGSAVE for SYNC");
         }
     } else {
-        /* Ok we don't have a BGSAVE in progress, let's start one */
+        /* 処理中のBGSAVEが無い場合、BGSAVEを開始します。*/
         redisLog(REDIS_NOTICE,"Starting BGSAVE for SYNC");
         if (rdbSaveBackground(server.rdb_filename) != REDIS_OK) {
             redisLog(REDIS_NOTICE,"Replication failed, can't BGSAVE");
@@ -501,15 +498,15 @@ void syncCommand(redisClient *c) {
             return;
         }
         c->replstate = REDIS_REPL_WAIT_BGSAVE_END;
-        /* Flush the script cache for the new slave. */
+        /* 新しいスレーブ用のスクリプトをフラッシュします。 */
         replicationScriptCacheFlush();
     }
 
     if (server.repl_disable_tcp_nodelay)
-        anetDisableTcpNoDelay(NULL, c->fd); /* Non critical if it fails. */
+        anetDisableTcpNoDelay(NULL, c->fd); /* クリティカルなエラーでは無い。 */
     c->repldbfd = -1;
     c->flags |= REDIS_SLAVE;
-    server.slaveseldb = -1; /* Force to re-emit the SELECT command. */
+    server.slaveseldb = -1; /* 強制的にSELECTコマンドを実行する。 */
     listAddNodeTail(server.slaves,c);
     if (listLength(server.slaves) == 1 && server.repl_backlog == NULL)
         createReplicationBacklog();
